@@ -13,6 +13,23 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 
+interface ArgsType {
+  "api-base-url"?: string;
+  "openapi-spec"?: string;
+  headers?: string;
+  name?: string;
+  version?: string;
+  [key: string]: unknown;
+}
+
+// Define the Tool schema interface
+interface ToolSchema {
+  type: "object";
+  properties: Record<string, any>;
+  required?: string[];
+  [k: string]: unknown;
+}
+
 interface OpenAPIMCPServerConfig {
   name: string;
   version: string;
@@ -59,7 +76,8 @@ function loadConfig(): OpenAPIMCPServerConfig {
       type: "string",
       description: "Server version",
     })
-    .help().argv;
+    .help()
+    .parseSync() as ArgsType;
 
   // Combine CLI args and env vars, with CLI taking precedence
   const apiBaseUrl = argv["api-base-url"] || process.env.API_BASE_URL;
@@ -128,7 +146,7 @@ class OpenAPIMCPServer {
       for (const [method, operation] of Object.entries(pathItem)) {
         if (method === "parameters" || !operation) continue;
 
-        const op = operation as OpenAPIV3.OperationObject;
+        const op = operation as any; // Using any since we're handling Swagger 2.0
         // Create a clean tool ID by removing the leading slash and replacing special chars
         const cleanPath = path.replace(/^\//, "");
         const toolId = `${method.toUpperCase()}-${cleanPath}`.replace(
@@ -136,34 +154,45 @@ class OpenAPIMCPServer {
           "-",
         );
         console.error(`Registering tool: ${toolId}`); // Debug logging
+        const toolSchema: ToolSchema = {
+          type: "object",
+          properties: {},
+        };
+        
         const tool: Tool = {
-          name:
-            op.operationId || op.summary || `${method.toUpperCase()} ${path}`,
-          description:
-            op.description ||
-            `Make a ${method.toUpperCase()} request to ${path}`,
-          inputSchema: {
-            type: "object",
-            properties: {},
-            // Add any additional properties from OpenAPI spec
-          },
+          name: op.summary || `${method.toUpperCase()} ${path}`,
+          description: op.description || `Make a ${method.toUpperCase()} request to ${path}`,
+          inputSchema: toolSchema,
         };
 
-        // Store the mapping between name and ID for reverse lookup
         console.error(`Registering tool: ${toolId} (${tool.name})`);
 
-        // Add parameters from operation
         if (op.parameters) {
+          console.error(`Parameters: ${JSON.stringify(op.parameters)}`);
           for (const param of op.parameters) {
             if ("name" in param && "in" in param) {
-              const paramSchema = param.schema as OpenAPIV3.SchemaObject;
-              tool.inputSchema.properties[param.name] = {
-                type: paramSchema.type || "string",
+              // Handle Swagger 2.0 parameter format
+              toolSchema.properties[param.name] = {
+                type: param.type || "string",
                 description: param.description || `${param.name} parameter`,
               };
+
+              // Handle array type parameters
+              if (param.type === "array" && param.items) {
+                toolSchema.properties[param.name] = {
+                  type: "array",
+                  items: {
+                    type: param.items.type || "string"
+                  },
+                  description: param.description || `${param.name} parameter`
+                };
+              }
+
               if (param.required) {
-                tool.inputSchema.required = tool.inputSchema.required || [];
-                tool.inputSchema.required.push(param.name);
+                if (!toolSchema.required) {
+                  toolSchema.required = [];
+                }
+                toolSchema.required.push(param.name);
               }
             }
           }
@@ -192,7 +221,7 @@ class OpenAPIMCPServer {
       let tool: Tool | undefined;
       let toolId: string | undefined;
 
-      if (id) {
+      if (id && typeof id === 'string') {
         toolId = id.trim();
         tool = this.tools.get(toolId);
       } else if (name) {
