@@ -160,7 +160,7 @@ class OpenAPIMCPServer {
         };
         
         const tool: Tool = {
-          name: op.summary || `${method.toUpperCase()} ${path}`,
+          name: sanitizeToolName(op.summary || `${method.toUpperCase()} ${path}`),
           description: op.description || `Make a ${method.toUpperCase()} request to ${path}`,
           inputSchema: toolSchema,
         };
@@ -353,6 +353,21 @@ async function main(): Promise<void> {
     console.error("Failed to start server:", error);
     process.exit(1);
   }
+}
+
+function sanitizeToolName(name: string): string {
+  // Replace any non-alphanumeric characters with underscores
+  let sanitized = name.replace(/[^a-zA-Z0-9_]/g, '_');
+  
+  // Ensure it's not longer than 64 characters
+  sanitized = sanitized.substring(0, 64);
+  
+  // Ensure it's not empty
+  if (sanitized.length === 0) {
+    sanitized = 'tool';
+  }
+  
+  return sanitized;
 }
 
 main();
