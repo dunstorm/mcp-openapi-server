@@ -30,6 +30,25 @@ interface ToolSchema {
   [k: string]: unknown;
 }
 
+// Define an interface for Swagger 2.0 Parameter Object
+interface SwaggerParameterObject {
+  name: string;
+  in: "query" | "header" | "path" | "formData" | "body";
+  description?: string;
+  required?: boolean;
+  type?: string; // 'string', 'number', 'integer', 'boolean', 'array', 'file'
+  items?: { type?: string; format?: string; [key: string]: any }; // For array type
+  schema?: OpenAPIV3.SchemaObject; // For 'body' parameter
+  [key: string]: any; // Allow other properties
+}
+
+interface ToolDetails {
+  toolDef: Tool;
+  apiPath: string; // Original path template, e.g., /users/{id}
+  apiMethod: string;
+  parametersSpec: SwaggerParameterObject[];
+}
+
 interface OpenAPIMCPServerConfig {
   name: string;
   version: string;
@@ -109,7 +128,7 @@ class OpenAPIMCPServer {
   private server: Server;
   private config: OpenAPIMCPServerConfig;
 
-  private tools: Map<string, Tool> = new Map();
+  private toolExecutionDetails: Map<string, ToolDetails> = new Map();
 
   constructor(config: OpenAPIMCPServerConfig) {
     this.config = config;
@@ -148,45 +167,48 @@ class OpenAPIMCPServer {
 
         const op = operation as any; // Using any since we're handling Swagger 2.0
         // Create a clean tool ID by removing the leading slash and replacing special chars
-        const cleanPath = path.replace(/^\//, "");
-        const toolId = `${method.toUpperCase()}-${cleanPath}`.replace(
+        const cleanPathIdPart = path.replace(/^\//, "").replace(/[{}]/g, ""); // Remove braces for ID - simplified regex
+        const toolId = `${method.toUpperCase()}-${cleanPathIdPart}`.replace(
           /[^a-zA-Z0-9-]/g,
           "-",
         );
-        console.error(`Registering tool: ${toolId}`); // Debug logging
+        
         const toolSchema: ToolSchema = {
           type: "object",
           properties: {},
         };
         
-        const tool: Tool = {
+        const mcpTool: Tool = {
           name: sanitizeToolName(op.summary || `${method.toUpperCase()} ${path}`),
           description: op.description || `Make a ${method.toUpperCase()} request to ${path}`,
           inputSchema: toolSchema,
         };
 
-        console.error(`Registering tool: ${toolId} (${tool.name})`);
+        console.error(`Registering tool: ${toolId} (${mcpTool.name})`);
+
+        const parametersSpec: SwaggerParameterObject[] = [];
 
         if (op.parameters) {
-          console.error(`Parameters: ${JSON.stringify(op.parameters)}`);
-          for (const param of op.parameters) {
-            if ("name" in param && "in" in param) {
-              // Handle Swagger 2.0 parameter format
+          // console.error(`Parameters: ${JSON.stringify(op.parameters)}`);
+          for (const param of op.parameters as SwaggerParameterObject[]) {
+            if (param.name && param.in) {
+              parametersSpec.push(param); // Store the full parameter spec
+
               toolSchema.properties[param.name] = {
-                type: param.type || "string",
+                type: param.type || "string", // Fallback to string if type is missing
                 description: param.description || `${param.name} parameter`,
               };
-
-              // Handle array type parameters
               if (param.type === "array" && param.items) {
-                toolSchema.properties[param.name] = {
-                  type: "array",
-                  items: {
-                    type: param.items.type || "string"
-                  },
-                  description: param.description || `${param.name} parameter`
+                toolSchema.properties[param.name].items = {
+                  type: param.items.type || "string",
                 };
+              } else if (param.in === "body" && param.schema) {
+                // For body parameters, try to represent the schema
+                // This is a simplified representation; full JSON schema conversion can be complex
+                toolSchema.properties[param.name].type = "object"; // Body params are often objects
+                // Optionally, you could try to convert param.schema to a more detailed MCP schema
               }
+
 
               if (param.required) {
                 if (!toolSchema.required) {
@@ -197,7 +219,12 @@ class OpenAPIMCPServer {
             }
           }
         }
-        this.tools.set(toolId, tool);
+        this.toolExecutionDetails.set(toolId, {
+          toolDef: mcpTool,
+          apiPath: path, // Store original path template
+          apiMethod: method.toUpperCase(),
+          parametersSpec,
+        });
       }
     }
   }
@@ -206,7 +233,9 @@ class OpenAPIMCPServer {
     // Handle tool listing
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
-        tools: Array.from(this.tools.values()),
+        tools: Array.from(this.toolExecutionDetails.values()).map(
+          (details) => details.toolDef,
+        ),
       };
     });
 
@@ -218,91 +247,143 @@ class OpenAPIMCPServer {
       console.error("Using parameters from arguments:", params);
 
       // Find tool by ID or name
-      let tool: Tool | undefined;
+      let toolDetails: ToolDetails | undefined;
       let toolId: string | undefined;
 
       if (id && typeof id === 'string') {
         toolId = id.trim();
-        tool = this.tools.get(toolId);
+        toolDetails = this.toolExecutionDetails.get(toolId);
       } else if (name) {
         // Search for tool by name
-        for (const [tid, t] of this.tools.entries()) {
-          if (t.name === name) {
-            tool = t;
+        for (const [tid, details] of this.toolExecutionDetails.entries()) {
+          if (details.toolDef.name === name) {
+            toolDetails = details;
             toolId = tid;
             break;
           }
         }
       }
 
-      if (!tool || !toolId) {
+      if (!toolDetails || !toolId) {
         console.error(
-          `Available tools: ${Array.from(this.tools.entries())
-            .map(([id, t]) => `${id} (${t.name})`)
+          `Available tools: ${Array.from(this.toolExecutionDetails.entries())
+            .map(([id, details]) => `${id} (${details.toolDef.name})`)
             .join(", ")}`,
         );
         throw new Error(`Tool not found: ${id || name}`);
       }
+      
+      const { toolDef, apiPath: originalPath, apiMethod, parametersSpec } = toolDetails;
 
-      console.error(`Executing tool: ${toolId} (${tool.name})`);
+      console.error(`Executing tool: ${toolId} (${toolDef.name})`);
+      console.error(`Original API path template: ${originalPath}`);
+      console.error(`API method: ${apiMethod}`);
+      console.error(`Parameter specs: ${JSON.stringify(parametersSpec)}`);
+      console.error(`Provided arguments: ${JSON.stringify(params)}`);
+
 
       try {
-        // Extract method and path from tool ID
-        const [method, ...pathParts] = toolId.split("-");
-        const path = "/" + pathParts.join("/").replace(/-/g, "/");
+        let processedPath = originalPath;
+        const queryParams: Record<string, string | string[]> = {};
+        let requestBody: any = undefined;
+        const requestHeaders = { ...this.config.headers }; // Start with base headers
+
+        if (params && typeof params === "object") {
+          for (const spec of parametersSpec) {
+            const value = (params as Record<string, any>)[spec.name];
+            if (value === undefined && spec.required) {
+              throw new Error(`Missing required parameter: ${spec.name}`);
+            }
+            if (value === undefined) continue;
+
+            switch (spec.in) {
+              case "path":
+                processedPath = processedPath.replace(`{${spec.name}}`, String(value));
+                break;
+              case "query":
+                if (Array.isArray(value)) {
+                  queryParams[spec.name] = value.map(String);
+                } else {
+                  queryParams[spec.name] = String(value);
+                }
+                break;
+              case "header":
+                requestHeaders[spec.name] = String(value);
+                break;
+              case "body":
+                requestBody = value; // Assumes 'value' is the entire body object
+                break;
+              case "formData":
+                // FormData handling can be complex, often requires specific content types
+                // For simplicity, if it's an object, pass it as body.
+                // For more complex scenarios, libraries like 'form-data' might be needed.
+                if (typeof value === "object" && !requestBody) {
+                  requestBody = value; // Or convert to FormData
+                  // Ensure Content-Type is set appropriately, e.g., application/x-www-form-urlencoded or multipart/form-data
+                } else {
+                  console.warn(`FormData parameter '${spec.name}' might not be handled correctly as simple value.`);
+                  // Fallback or specific handling might be needed here
+                  if (!requestBody) requestBody = {};
+                  (requestBody as Record<string, any>)[spec.name] = value;
+                }
+                break;
+            }
+          }
+        }
+        
+        console.error(`Processed path: ${processedPath}`);
+        console.error(`Query params: ${JSON.stringify(queryParams)}`);
+        if (requestBody) console.error(`Request body: ${JSON.stringify(requestBody)}`);
+        console.error(`Request headers: ${JSON.stringify(requestHeaders)}`);
+
 
         // Ensure base URL ends with slash for proper joining
         const baseUrl = this.config.apiBaseUrl.endsWith("/")
           ? this.config.apiBaseUrl
           : `${this.config.apiBaseUrl}/`;
 
-        // Remove leading slash from path to avoid double slashes
-        const cleanPath = path.startsWith("/") ? path.slice(1) : path;
+        // Remove leading slash from path to avoid double slashes if present
+        const cleanPath = processedPath.startsWith("/") ? processedPath.slice(1) : processedPath;
+        const fullUrl = new URL(cleanPath, baseUrl).toString();
 
-        // Construct the full URL
-        const url = new URL(cleanPath, baseUrl).toString();
-
-        //console.error(`Making API request: ${method.toLowerCase()} ${url}`);
-        //console.error(`Base URL: ${baseUrl}`);
-        //console.error(`Path: ${cleanPath}`);
-        //console.error(`Raw parameters:`, params);
-        //console.error(`Request headers:`, this.config.headers);
-
-        // Prepare request configuration
-        const config: any = {
-          method: method.toLowerCase(),
-          url: url,
-          headers: this.config.headers,
+        const axiosConfig: any = {
+          method: apiMethod.toLowerCase(),
+          url: fullUrl,
+          headers: requestHeaders,
         };
 
-        // Handle different parameter types based on HTTP method
-        if (method.toLowerCase() === "get") {
+        if (Object.keys(queryParams).length > 0) {
           // For GET requests, ensure parameters are properly structured
-          if (params && typeof params === "object") {
-            // Handle array parameters properly
-            const queryParams: Record<string, string> = {};
-            for (const [key, value] of Object.entries(params)) {
-              if (Array.isArray(value)) {
-                // Join array values with commas for query params
-                queryParams[key] = value.join(",");
-              } else if (value !== undefined && value !== null) {
-                // Convert other values to strings
-                queryParams[key] = String(value);
+          if (apiMethod.toLowerCase() === "get" || apiMethod.toLowerCase() === "delete") { // Also for DELETE often
+             // Handle array parameters properly for query
+            const finalQueryParams: Record<string, string> = {};
+            for (const [key, val] of Object.entries(queryParams)) {
+              if (Array.isArray(val)) {
+                finalQueryParams[key] = val.join(","); // Default CSV, adjust if API needs other format
+              } else {
+                finalQueryParams[key] = String(val);
               }
             }
-            config.params = queryParams;
+            axiosConfig.params = finalQueryParams;
+          } else if (requestBody === undefined) {
+            // If not GET/DELETE and no body yet, form data might go here (e.g. x-www-form-urlencoded)
+            // This depends on the Content-Type; for now, assume JSON if body is set later
+            // If Content-Type is x-www-form-urlencoded, queryParams might need to be stringified
+             console.warn("Query parameters for non-GET/DELETE request without explicit body. Review API spec.");
+             axiosConfig.data = queryParams; // Or URLSearchParams(queryParams).toString() if content-type is form-urlencoded
+
           }
-        } else {
-          // For POST, PUT, PATCH - send as body
-          config.data = params;
+        }
+        
+        if (requestBody !== undefined) {
+          axiosConfig.data = requestBody;
         }
 
-        console.error(`Processed parameters:`, config.params || config.data);
 
-        console.error("Final request config:", config);
+        console.error("Final request config:", JSON.stringify(axiosConfig, null, 2));
 
         try {
-          const response = await axios(config);
+          const response = await axios(axiosConfig);
           console.error("Response status:", response.status);
           console.error("Response headers:", response.headers);
           console.error("Response data:", response.data);
